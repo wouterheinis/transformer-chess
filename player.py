@@ -22,33 +22,16 @@ def _device() -> torch.device:
   return torch.device("cpu")
 
 class TransformerPlayer(Player):
-  """
-  TransformerPlayer (V1)
-
-  Strategy:
-    1) Opening book for a few early positions (exact FEN -> UCI move).
-    2) Tactical safety layer:
-         - Play mate-in-1 if available.
-         - Avoid moves that allow opponent mate-in-1.
-    3) Policy selection using a general pretrained decoder LM:
-         - Score legal moves by average log-probability under the LM given a FEN prompt.
-         - Use a light 2-ply "minimax-lite" over the top-K LM moves:
-             pick move maximizing (my_score - opponent_best_reply_score).
-    4) Speed:
-         - KV-cache reuse: process prompt once, then score move tokens cheaply.
-         - Caching: memoize (fen, move-set) -> scores via lru_cache.
-  """
 
   def __init__(self, name: str):
     super().__init__(name)
 
     # ----------------------------
-    # Model + tokenizer (local, transformer-based)
+    # Model + tokenizer 
     # ----------------------------
     self.model_name = "distilgpt2"
     self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
-    # GPT2-family has no pad token by default; use EOS for batching/padding.
     if self.tokenizer.pad_token is None:
       self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -58,18 +41,16 @@ class TransformerPlayer(Player):
     self.dev = _device()
     self.model.to(self.dev)
 
-    # Speed: fp16 inference on GPU
     if self.dev.type == "cuda":
       self.model.half()
 
     # ----------------------------
     # Caches
     # ----------------------------
-    # NOTE: lru_cache size is set on the decorator for _cached_scores.
     self._score_cache_max = 4096
 
     # ----------------------------
-    # Opening book (exact FEN -> UCI)
+    # Opening book 
     # ----------------------------
     def build_opening_book() -> Dict[str, str]:
       """
@@ -88,10 +69,10 @@ class TransformerPlayer(Player):
         board = chess.Board()
         for uci in moves:
           fen = board.fen()
-          # Only store if the move is legal in this position.
+          # Only store if the move is legal in this position
           mv = chess.Move.from_uci(uci)
           if mv in board.legal_moves:
-            # If multiple lines write the same FEN, keep the first.
+            # If multiple lines write the same FEN, keep the first
             book.setdefault(fen, uci)
             board.push(mv)
           else:
@@ -99,71 +80,60 @@ class TransformerPlayer(Player):
             break
 
       # ------------------------------------------------------------------------
-      # WHITE REPERTOIRE (trappy but not suicidal)
-      # Core idea: e4, Nf3, Bc4, c3, d4 (Italian / Scotch-ish center breaks)
-      # Plus responses to common + random early black moves.
+      # WHITE REPERTOIRE 
       # ------------------------------------------------------------------------
 
-      # Start: always play 1.e4
+      # 1.e4
       add_line(["e2e4"])
 
-      # If Black plays a normal response:
-      # 1.e4 e5 2.Nf3 (then aim Bc4 and d4 ideas)
+      # 1.e4 e5 2.Nf3 
       add_line(["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "d2d3"])
       # Alternative: Scotch-style center break if you want more tactics:
       add_line(["e2e4", "e7e5", "g1f3", "b8c6", "d2d4", "e5d4", "f3d4"])
 
-      # 1.e4 c5 (Sicilian): keep it simple and active
+      # 1.e4 c5 
       add_line(["e2e4", "c7c5", "g1f3", "d7d6", "d2d4"])
       add_line(["e2e4", "c7c5", "g1f3", "e7e6", "d2d4"])
       add_line(["e2e4", "c7c5", "g1f3", "g8f6", "d2d4"])
 
-      # 1.e4 e6 (French): classical setup
+      # 1.e4 e6 
       add_line(["e2e4", "e7e6", "d2d4", "d7d5", "b1c3"])
 
-      # 1.e4 c6 (Caro-Kann): classical setup
+      # 1.e4 c6 
       add_line(["e2e4", "c7c6", "d2d4", "d7d5", "b1c3"])
 
-      # 1.e4 d5 (Scandinavian): just develop (many bots play this)
+      # 1.e4 d5 
       add_line(["e2e4", "d7d5", "e4d5", "d8d5", "b1c3"])
 
-      # "Random-ish" black replies after 1.e4: a6, h6, g6, b6, f6, g5, d6, Nc6, Nf6
-      # We respond with principled development: Nf3 and/or Bc4 and/or d4.
+      # random stuff
       for black_reply in ["a7a6", "h7h6", "g7g6", "b7b6", "f7f6", "g7g5", "d7d6", "b8c6", "g8f6"]:
         add_line(["e2e4", black_reply, "g1f3"])
 
-      # If they play ...g6 early, punish with quick center + bishop pressure
+      # against early g6
       add_line(["e2e4", "g7g6", "d2d4", "f8g7", "f1c4"])
 
-      # If they play ...f6 (awful), go for immediate center hit
-      add_line(["e2e4", "f7f6", "d2d4"])
 
       # ------------------------------------------------------------------------
-      # BLACK REPERTOIRE vs 1.e4 (Caro-Kann, solid)
-      # Goal: c6 + d5 structure, develop naturally.
+      # BLACK REPERTOIRE 
       # ------------------------------------------------------------------------
-
-      # We need to add black lines too. To do that, we encode full sequences from the start,
-      # where White plays e4 first, then we play our black response.
 
       # 1.e4 -> 1...c6
       add_line(["e2e4", "c7c6"])
 
-      # Typical: 2.d4 -> 2...d5 -> 3.Nc3 -> 3...dxe4 (mainline)
+      # 2.d4 -> 2...d5 -> 3.Nc3 -> 3...dxe4 
       add_line(["e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"])
 
-      # If White plays 2.Nf3 instead of 2.d4: still play 2...d5
       add_line(["e2e4", "c7c6", "g1f3", "d7d5"])
 
-      # If White plays 2.Nc3: play 2...d5
+      # 2.Nc3 d5
       add_line(["e2e4", "c7c6", "b1c3", "d7d5"])
 
-      # If White plays a random second move (Bc4, f4, h3, etc.), still go ...d5
+      # random stuff
       for white_second in ["f1c4", "f2f4", "h2h3", "a2a3", "g2g3", "b2b3"]:
         add_line(["e2e4", "c7c6", white_second, "d7d5"])
 
       # ------------------------------------------------------------------------
-      # BLACK REPERTOIRE vs 1.d4 (solid: ...d5, then ...Nf6 / ...e6)
+      # BLACK REPERTOIRE vs 1.d4 
       # ------------------------------------------------------------------------
 
       add_line(["d2d4", "d7d5"])
@@ -177,7 +147,7 @@ class TransformerPlayer(Player):
       # If 2.Nc3 -> ...Nf6
       add_line(["d2d4", "d7d5", "b1c3", "g8f6"])
 
-      # If they play something random after 1.d4, keep it solid: ...d5 then ...Nf6
+      # random stuff
       for white_second in ["e2e3", "g2g3", "f2f4", "b2b3", "c2c3", "a2a3"]:
         add_line(["d2d4", "d7d5", white_second, "g8f6"])
 
@@ -187,19 +157,9 @@ class TransformerPlayer(Player):
 
 
   def get_move(self, fen: str) -> Optional[str]:
-    """
-    Return a legal UCI move for the given FEN, or None if no legal moves exist.
-
-    Move selection pipeline:
-      0) Opening book
-      1) Mate-in-1
-      2) Avoid allowing opponent mate-in-1
-      3) Beam alpha–beta (depth 4 by default), with LM move ordering
-      4) Small heuristic move bonus at root (development + capture)
-    """
 
     # ----------------------------
-    # 0) Opening book (exact FEN lookup)
+    # 0) Opening book 
     # ----------------------------
     book_move = self.opening_book.get(fen)
     if book_move is not None:
@@ -216,7 +176,7 @@ class TransformerPlayer(Player):
       return legal[0].uci()
 
     # ----------------------------
-    # 1) Immediate tactical win: mate in 1
+    # 1) mate in 1
     # ----------------------------
     mate_move = self._find_mate_in_1(board)
     if mate_move is not None:
@@ -224,7 +184,7 @@ class TransformerPlayer(Player):
 
     try:
       # ----------------------------
-      # 2) Tactical safety: avoid allowing opponent mate in 1
+      # 2) avoid allowing opponent mate in 1
       # ----------------------------
       safe_moves = []
       for m in legal:
@@ -232,27 +192,24 @@ class TransformerPlayer(Player):
           safe_moves.append(m)
       candidates = safe_moves if safe_moves else legal
 
-      # Search/beam settings (tune safely)
-      # Depth: 3 when branching is manageable, else 2
-      # (You can tune these thresholds)
+      # Search/beam settings 
       DEPTH = 4 if len(candidates) <= 22 else 3
 
       # Root caps
-      ROOT_LM_POOL = min(len(candidates), 24)  # hard cap 18–24; we'll ensure >=18 below
-      K_ROOT = min(12, ROOT_LM_POOL)           # how many root moves we actually search
+      ROOT_LM_POOL = min(len(candidates), 24)  
+      K_ROOT = min(12, ROOT_LM_POOL)           
 
-      # Beam below root: 5–7
+      # Beam below root
       K_MAX = 7
       K_MIN = 6
 
       LAMBDA = 0.25
 
       # ----------------------------
-      # 3) Root LM ordering (ONLY at root), on a capped pool.
-      # First cheaply pick a pool (checks/captures/promos etc.)
+      # 3) Root LM ordering 
       # ----------------------------
-      
-      pool_size = max(18, ROOT_LM_POOL)  # ensure 18–24 behavior
+
+      pool_size = max(18, ROOT_LM_POOL) 
       pool_size = min(pool_size, len(candidates))
 
       root_pool = self._top_k_heuristic(board, candidates, k=pool_size)
@@ -266,7 +223,7 @@ class TransformerPlayer(Player):
       # cand_pairs is now only top K_ROOT, ordered by LM score
       cand_pairs = [(uci_to_move[uci], sc) for (uci, sc) in top_root if uci in uci_to_move]
 
-      # Decide whether we are maximizing or minimizing White-eval at the root
+      # Decide whether we are maximizing or minimizing White-eval
       root_is_white = (board.turn == chess.WHITE)
 
       # Initialize best value from White perspective
@@ -274,18 +231,16 @@ class TransformerPlayer(Player):
       best_move = cand_pairs[0][0]  # fallback to best LM move
 
       for m, my_lm_score in cand_pairs[: min(K_ROOT, len(cand_pairs))]:
-        # Root move bonus (development + capture)
+        # Root move bonus 
         bonus = self._move_bonus(board, m, fen)
 
         board.push(m)
 
-        # If we just delivered mate, always take it
         if board.is_checkmate():
           board.pop()
           return m.uci()
 
         # Alpha-beta from the position after our move
-        # maximizing_for_white should reflect whose turn it is now
         val = self._alphabeta_beam(
           board=board,
           depth=DEPTH - 1,
@@ -328,7 +283,7 @@ class TransformerPlayer(Player):
     return None
 
   def _allows_opponent_mate_in_1(self, board: chess.Board, move: chess.Move) -> bool:
-    """Return True if, after playing `move`, the opponent has a mate-in-1 reply."""
+    """Return True if, after playing 'move', the opponent has a mate-in-1 reply."""
     board.push(move)
     try:
       for reply in board.legal_moves:
@@ -343,14 +298,7 @@ class TransformerPlayer(Player):
 
   def _development_bonus(self, board: chess.Board, move: chess.Move, ply: int) -> float:
     """
-    Small positional bonus to favor sensible development:
-      - Develop knights/bishops early
-      - Castle early
-      - Avoid moving the same piece repeatedly in the opening
-      - Prefer central pawn pushes early (e4/d4/c4) over flank pawn pushes
-      - Avoid early queen moves
-      - Prefer connecting rooks / rook to central file later
-    `ply` is half-move number from the FEN (0-based is fine).
+    Small positional bonus to favor sensible development
     """
     # Only apply strongly in the opening
     if ply > 20:
@@ -365,26 +313,25 @@ class TransformerPlayer(Player):
     # Identify side to move
     us = board.turn
 
-    # --- Castle bonus ---
+    # Castle bonus 
     if board.is_castling(move):
-      bonus += 3.5  # big push toward safety
-      return bonus  # castle is usually a whole-plan move
+      bonus += 3.5  
+      return bonus  
 
-    # --- Piece development bonuses ---
-    # Knights: from starting squares to natural squares
+    # Piece development bonuses 
     if piece.piece_type == chess.KNIGHT:
-      # starting squares: b1/g1 or b8/g8
+      # Knights
       if (us == chess.WHITE and move.from_square in [chess.B1, chess.G1]) or \
         (us == chess.BLACK and move.from_square in [chess.B8, chess.G8]):
         bonus += 1.2
-      # prefer toward center: c3/f3 (white) or c6/f6 (black)
+      # prefer toward center: c3/f3 or c6/f6 
       to = move.to_square
       if us == chess.WHITE and to in [chess.C3, chess.F3, chess.D2, chess.E2]:
         bonus += 0.5
       if us == chess.BLACK and to in [chess.C6, chess.F6, chess.D7, chess.E7]:
         bonus += 0.5
 
-    # Bishops: from starting squares to active diagonals
+    # Bishops to active diagonals
     if piece.piece_type == chess.BISHOP:
       if (us == chess.WHITE and move.from_square in [chess.C1, chess.F1]) or \
         (us == chess.BLACK and move.from_square in [chess.C8, chess.F8]):
@@ -395,15 +342,15 @@ class TransformerPlayer(Player):
       if us == chess.BLACK and move.to_square in [chess.C5, chess.B4, chess.D6, chess.E7, chess.F5]:
         bonus += 0.4
 
-    # --- Penalize early queen moves ---
+    # Penalize early queen moves 
     if piece.piece_type == chess.QUEEN and ply <= 12:
       bonus -= 1.2
 
-    # --- Penalize rook moves very early (unless forced) ---
+    # Penalize rook moves very early 
     if piece.piece_type == chess.ROOK and ply <= 14:
       bonus -= 0.6
 
-    # --- Pawn move shaping ---
+    # Pawn move shaping 
     if piece.piece_type == chess.PAWN:
       # Prefer central pawn moves in the opening
       if us == chess.WHITE and move.from_square in [chess.D2, chess.E2, chess.C2]:
@@ -411,19 +358,17 @@ class TransformerPlayer(Player):
       if us == chess.BLACK and move.from_square in [chess.D7, chess.E7, chess.C7]:
         bonus += 0.4
 
-      # Penalize flank pawns early (a/h) and random pawn shuffles
+      # Penalize flank pawns early and random shuffles
       if us == chess.WHITE and move.from_square in [chess.A2, chess.H2] and ply <= 10:
         bonus -= 0.6
       if us == chess.BLACK and move.from_square in [chess.A7, chess.H7] and ply <= 10:
         bonus -= 0.6
 
-    # --- Discourage moving same piece repeatedly early ---
-    # Very simple heuristic: if this move returns a piece to its original square, punish.
-    # (You can improve by tracking history, but this is cheap.)
+    # Discourage moving same piece repeatedly early 
     if move.to_square == move.from_square:
       bonus -= 0.5
 
-    # --- Small bonus for giving check (often tactical), but keep it small ---
+    #  Small bonus for giving check 
     if board.gives_check(move):
       bonus += 0.2
 
@@ -443,7 +388,6 @@ class TransformerPlayer(Player):
   def _capture_bonus(self, board: chess.Board, move: chess.Move, ply: int) -> float:
     """
     Small bonus to encourage making progress via captures.
-    Tries to reward *good* captures more than random pawn grabs.
     """
     if not board.is_capture(move):
       return 0.0
@@ -457,7 +401,7 @@ class TransformerPlayer(Player):
     victim = board.piece_at(move.to_square)
     attacker = board.piece_at(move.from_square)
 
-    # En passant: victim isn't on the to_square, so handle that.
+    # En passant
     if victim is None and board.is_en_passant(move):
       victim_value = 1
     else:
@@ -465,11 +409,9 @@ class TransformerPlayer(Player):
 
     attacker_value = self._piece_value(attacker.piece_type) if attacker else 1
 
-    # Prefer winning bigger pieces; slightly prefer captures by smaller attackers.
-    # Keep these numbers small: this is just a tie-breaker.
+    # Prefer winning bigger pieces
     bonus = 0.25 * victim_value - 0.05 * attacker_value
 
-    # If it's a capture that also gives check, add a tiny extra (often tactical).
     if board.gives_check(move):
       bonus += 0.10
 
@@ -493,8 +435,7 @@ class TransformerPlayer(Player):
     return dev + cap
 
   # ============================================================================
-  # Static evaluation (board scoring) for alpha-beta
-  # Scores are from White perspective: positive = good for White.
+  # Static evaluation for alpha-beta
   # ============================================================================
 
   def _material_eval_white(self, board: chess.Board) -> int:
@@ -556,8 +497,7 @@ class TransformerPlayer(Player):
 
   def _mobility_eval_white(self, board: chess.Board) -> int:
     """
-    Mobility: (#legal moves for White) - (#legal moves for Black), scaled.
-    We compute it by temporarily switching the side to move using a null move.
+    Mobility: (#legal moves for White) - (#legal moves for Black)
     """
     try:
       stm = board.turn
@@ -567,7 +507,7 @@ class TransformerPlayer(Player):
       opp_moves = board.legal_moves.count()
       board.pop()
 
-      # If side-to-move was White, my_moves are White's mobility; else Black's.
+      # If side-to-move was White, my_moves are White's mobility; else Black's
       if stm == chess.WHITE:
         return 2 * (my_moves - opp_moves)
       else:
@@ -593,7 +533,7 @@ class TransformerPlayer(Player):
     )
 
   # ============================================================================
-  # LM-based move ordering for alpha-beta (beam search)
+  # LM-based move ordering for alpha-beta 
   # ============================================================================
 
   def _ordered_moves_lm(
@@ -614,7 +554,7 @@ class TransformerPlayer(Player):
     if not legal:
       return []
 
-    # Heuristic prefilter: only score a subset with the LM
+    # Heuristic prefilter: only score subset with LM
     M = max(prefilter_min, min(len(legal), k * prefilter_mult))
     pool = self._top_k_heuristic(board, legal, k=M)
 
@@ -625,7 +565,7 @@ class TransformerPlayer(Player):
     top = self._top_k_by_score(moves_uci, scores, k=k)
     top_set = {uci for (uci, _) in top}
 
-    # Preserve the LM rank order from `top`
+    # Preserve the LM rank order from top
     uci_to_move = {m.uci(): m for m in pool}
     return [uci_to_move[uci] for (uci, _) in top if uci in uci_to_move and uci in top_set]
 
@@ -648,7 +588,7 @@ class TransformerPlayer(Player):
     white_to_move = (board.turn == chess.WHITE)
     k = k_max if white_to_move else k_min
 
-    # Heuristic ordering only (fast)
+    # Heuristic ordering only
     moves = self._ordered_moves_heuristic(board, k=k)
     if not moves:
       return self._static_eval_white(board)
@@ -680,7 +620,7 @@ class TransformerPlayer(Player):
 
   def _top_k_heuristic(self, board: chess.Board, moves: List[chess.Move], k: int = 12) -> List[chess.Move]:
     """
-    Optional: a cheap heuristic filter you can use to reduce scoring cost.
+    Heuristic filter to reduce scoring cost.
     Prioritizes checks, captures, and promotions.
     """
     def score(m: chess.Move) -> int:
@@ -704,8 +644,8 @@ class TransformerPlayer(Player):
 
   def _ordered_moves_heuristic(self, board: chess.Board, k: int) -> List[chess.Move]:
     """
-    Cheap move ordering for search nodes (below root).
-    Prioritize: checks, promotions, captures (MVV-ish), then a tiny development bias.
+    Cheap move ordering for search nodes 
+    Prioritize: checks, promotions, captures, then a tiny development bias.
     """
     ply = self._ply_from_fen(board.fen())
 
@@ -726,10 +666,10 @@ class TransformerPlayer(Player):
         victim_val = 1 if (victim is None and board.is_en_passant(m)) else (self._piece_value(victim.piece_type) if victim else 1)
         attacker_val = self._piece_value(attacker.piece_type) if attacker else 1
 
-        # prefer winning larger pieces, slightly prefer capturing with smaller pieces
+        # prefer winning larger pieces
         s += 500.0 * victim_val - 50.0 * attacker_val
 
-      # small opening bias (won't dominate tactics)
+      # small opening bias
       s += 30.0 * self._development_bonus(board, m, ply)
 
       return s
@@ -743,20 +683,18 @@ class TransformerPlayer(Player):
   # ============================================================================
 
   def _make_prompt(self, fen: str) -> str:
-    """Prompt format: keep short and consistent; UCI moves only."""
-    return f"You are a strong chess engine. Best move given FEN: {fen}\nMOVE:"
+    return f"FEN: {fen}\nMOVE:"
 
   @lru_cache(maxsize=4096)
   def _cached_scores(self, fen: str, moves_tuple: Tuple[str, ...]) -> Tuple[float, ...]:
     """
     Memoize scores for a given (fen, sorted_moves_tuple).
-    This is useful because the same position can be evaluated multiple times.
     """
     return tuple(self._score_moves_batch(self._make_prompt(fen), list(moves_tuple)))
 
   def _score_legal_moves(self, fen: str, moves_uci: List[str]) -> List[float]:
     """
-    Score each move in `moves_uci` as average log-probability under the LM:
+    Score each move in 'moves_uci' as average log-probability under the LM:
       score(move) = avg_logP(move_tokens | prompt(FEN)).
     """
     moves_sorted = tuple(sorted(moves_uci))
@@ -771,13 +709,12 @@ class TransformerPlayer(Player):
   # ----------------------------
 
   def _encode_prompt(self, prompt: str) -> torch.Tensor:
-    """Tokenize the prompt (no special tokens)."""
     ids = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
     return ids.to(self.dev)
 
   def _encode_move(self, mv: str) -> torch.Tensor:
     """
-    Tokenize a move string. Leading space improves tokenization consistency for GPT2-family.
+    Tokenizes a move string
     """
     ids = self.tokenizer(" " + mv, add_special_tokens=False, return_tensors="pt")["input_ids"]
     return ids.to(self.dev)
@@ -792,10 +729,10 @@ class TransformerPlayer(Player):
     prompt_ids = self._encode_prompt(prompt)  # (1, Lp)
     out = self.model(input_ids=prompt_ids, use_cache=True)
 
-    past = out.past_key_values                 # Cache object OR legacy tuple
+    past = out.past_key_values                 
     next_logits = out.logits[:, -1, :]         # (1, V)
 
-    # 2) Encode all moves -> padded batch
+    # 2) Encode all moves into padded batch
     move_ids_list = [self._encode_move(mv).squeeze(0) for mv in moves]
     lens = [int(t.numel()) for t in move_ids_list]
     max_len = max(lens)
@@ -811,7 +748,7 @@ class TransformerPlayer(Player):
       move_ids[i, :n] = t
       move_attn[i, :n] = True
 
-    # 3) Expand cache to batch size B (cache-type aware)
+    # 3) Expand cache to batch size B 
     if hasattr(past, "batch_repeat_interleave"):
       # New Cache API (fast + correct)
       past_b = past.batch_repeat_interleave(B)
@@ -827,7 +764,7 @@ class TransformerPlayer(Player):
         ))
       past_b = tuple(past_b)
     else:
-      # Last-resort: try a simple repeat if available
+      # try a simple repeat if available
       if hasattr(past, "repeat_interleave"):
         past_b = past.repeat_interleave(B)
       else:
