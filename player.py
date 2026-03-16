@@ -13,794 +13,859 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from chess_tournament import Player
 
+# ---------------------------------------------------------------------------
+# PyTorch performance flags
+# ---------------------------------------------------------------------------
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
+
 def _device() -> torch.device:
-  if torch.cuda.is_available():
-    return torch.device("cuda")
-  return torch.device("cpu")
+    """Return CUDA if available, otherwise CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+# ---------------------------------------------------------------------------
+# Search / beam constants
+# ---------------------------------------------------------------------------
+DEPTH_MANY_CANDIDATES = 3   # Search depth when there are many root candidates
+DEPTH_FEW_CANDIDATES  = 4   # Search depth when candidates are manageable (≤22)
+CANDIDATE_THRESHOLD   = 22  # Root candidate count below which we use the deeper depth
+
+ROOT_LM_POOL_SIZE = 24  # How many moves to score with the LM at the root
+K_ROOT            = 12  # How many top-LM moves to actually search at the root
+
+K_MAX = 7   # Beam width for the side to move inside the tree
+K_MIN = 6   # Beam width for the opponent's side inside the tree
+
+LM_BONUS_LAMBDA = 0.25  # Weight of the LM bonus added to the alpha-beta score
+
+
+# ===========================================================================
+# TransformerPlayer
+# ===========================================================================
 
 class TransformerPlayer(Player):
+    """
+    Chess engine that combines a pre-trained transformer (DistilGPT-2) with
+    classical alpha-beta search.
 
-  def __init__(self, name: str):
-    super().__init__(name)
+    Architecture
+    ------------
+    1. Opening book  – a handcrafted set of lines for the first few moves.
+    2. LM policy     – DistilGPT-2 scores UCI moves conditioned on the FEN.
+    3. Alpha-beta    – beam-limited search guided by heuristic move ordering.
 
-    # ----------------------------
-    # Model + tokenizer 
-    # ----------------------------
-    self.model_name = "distilgpt2"
-    self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+    The transformer acts as a *policy* at the root: it ranks candidates so
+    that only the most plausible moves are explored by the alpha-beta search.
+    No fine-tuning was performed; the model is used entirely out-of-the-box.
+    """
 
-    if self.tokenizer.pad_token is None:
-      self.tokenizer.pad_token = self.tokenizer.eos_token
+    # -----------------------------------------------------------------------
+    # Initialisation
+    # -----------------------------------------------------------------------
 
-    self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
-    self.model.eval()
+    def __init__(self, name: str):
+        super().__init__(name)
+        self._init_model()
+        self.opening_book = self._build_opening_book()
 
-    self.dev = _device()
-    self.model.to(self.dev)
+    def _init_model(self) -> None:
+        """Load DistilGPT-2 and move it to the best available device."""
+        self.model_name = "distilgpt2"
+        self.tokenizer  = AutoTokenizer.from_pretrained(self.model_name)
 
-    if self.dev.type == "cuda":
-      self.model.half()
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    # ----------------------------
-    # Caches
-    # ----------------------------
-    self._score_cache_max = 4096
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+        self.model.eval()
 
-    # ----------------------------
-    # Opening book 
-    # ----------------------------
-    def build_opening_book() -> Dict[str, str]:
-      """
-      Returns: dict mapping exact FEN -> our chosen UCI move.
+        self.dev = _device()
+        self.model.to(self.dev)
 
-      The book is built from short move sequences. For every prefix position where it is
-      "our turn" in that sequence, we record the next move as the book move.
-      """
-      book: Dict[str, str] = {}
+        # Use half-precision on GPU to reduce memory and speed up inference
+        if self.dev.type == "cuda":
+            self.model.half()
 
-      def add_line(moves: List[str]) -> None:
+    # -----------------------------------------------------------------------
+    # Opening book construction
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _build_opening_book() -> Dict[str, str]:
         """
-        Add a full line of UCI moves starting from the initial position.
-        Stores (fen_before_our_move -> our_move) for every step where it's our turn.
+        Build a FEN → UCI move mapping from a set of hard-coded opening lines.
+
+        For every position in each line where it is *our* turn, we record the
+        next move as the book response.  If two lines share a FEN, the first
+        one wins (``setdefault``).
         """
-        board = chess.Board()
-        for uci in moves:
-          fen = board.fen()
-          # Only store if the move is legal in this position
-          mv = chess.Move.from_uci(uci)
-          if mv in board.legal_moves:
-            # If multiple lines write the same FEN, keep the first
-            book.setdefault(fen, uci)
-            board.push(mv)
-          else:
-            # Stop line if illegal
-            break
-
-      # ------------------------------------------------------------------------
-      # WHITE REPERTOIRE 
-      # ------------------------------------------------------------------------
-
-      # 1.e4
-      add_line(["e2e4"])
-
-      # 1.e4 e5 2.Nf3 
-      add_line(["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "d2d3"])
-      # Alternative: Scotch-style center break if you want more tactics:
-      add_line(["e2e4", "e7e5", "g1f3", "b8c6", "d2d4", "e5d4", "f3d4"])
-
-      # 1.e4 c5 
-      add_line(["e2e4", "c7c5", "g1f3", "d7d6", "d2d4"])
-      add_line(["e2e4", "c7c5", "g1f3", "e7e6", "d2d4"])
-      add_line(["e2e4", "c7c5", "g1f3", "g8f6", "d2d4"])
-
-      # 1.e4 e6 
-      add_line(["e2e4", "e7e6", "d2d4", "d7d5", "b1c3"])
-
-      # 1.e4 c6 
-      add_line(["e2e4", "c7c6", "d2d4", "d7d5", "b1c3"])
-
-      # 1.e4 d5 
-      add_line(["e2e4", "d7d5", "e4d5", "d8d5", "b1c3"])
-
-      # random stuff
-      for black_reply in ["a7a6", "h7h6", "g7g6", "b7b6", "f7f6", "g7g5", "d7d6", "b8c6", "g8f6"]:
-        add_line(["e2e4", black_reply, "g1f3"])
-
-      # against early g6
-      add_line(["e2e4", "g7g6", "d2d4", "f8g7", "f1c4"])
-
-
-      # ------------------------------------------------------------------------
-      # BLACK REPERTOIRE 
-      # ------------------------------------------------------------------------
-
-      # 1.e4 -> 1...c6
-      add_line(["e2e4", "c7c6"])
-
-      # 2.d4 -> 2...d5 -> 3.Nc3 -> 3...dxe4 
-      add_line(["e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"])
-
-      add_line(["e2e4", "c7c6", "g1f3", "d7d5"])
-
-      # 2.Nc3 d5
-      add_line(["e2e4", "c7c6", "b1c3", "d7d5"])
-
-      # random stuff
-      for white_second in ["f1c4", "f2f4", "h2h3", "a2a3", "g2g3", "b2b3"]:
-        add_line(["e2e4", "c7c6", white_second, "d7d5"])
-
-      # ------------------------------------------------------------------------
-      # BLACK REPERTOIRE vs 1.d4 
-      # ------------------------------------------------------------------------
-
-      add_line(["d2d4", "d7d5"])
-
-      # If 2.c4 -> ...e6 (QGD structure)
-      add_line(["d2d4", "d7d5", "c2c4", "e7e6"])
-
-      # If 2.Nf3 -> ...Nf6
-      add_line(["d2d4", "d7d5", "g1f3", "g8f6"])
-
-      # If 2.Nc3 -> ...Nf6
-      add_line(["d2d4", "d7d5", "b1c3", "g8f6"])
-
-      # random stuff
-      for white_second in ["e2e3", "g2g3", "f2f4", "b2b3", "c2c3", "a2a3"]:
-        add_line(["d2d4", "d7d5", white_second, "g8f6"])
-
-      return book
-
-    self.opening_book = build_opening_book()
-
-
-  def get_move(self, fen: str) -> Optional[str]:
-
-    # ----------------------------
-    # 0) Opening book 
-    # ----------------------------
-    book_move = self.opening_book.get(fen)
-    if book_move is not None:
-      board_book = chess.Board(fen)
-      if chess.Move.from_uci(book_move) in board_book.legal_moves:
-        return book_move
-
-    board = chess.Board(fen)
-    legal = list(board.legal_moves)
-    if not legal:
-      return None
-
-    if len(legal) == 1:
-      return legal[0].uci()
-
-    # ----------------------------
-    # 1) mate in 1
-    # ----------------------------
-    mate_move = self._find_mate_in_1(board)
-    if mate_move is not None:
-      return mate_move
-
-    try:
-      # ----------------------------
-      # 2) avoid allowing opponent mate in 1
-      # ----------------------------
-      safe_moves = []
-      for m in legal:
-        if not self._allows_opponent_mate_in_1(board, m):
-          safe_moves.append(m)
-      candidates = safe_moves if safe_moves else legal
-
-      # Search/beam settings 
-      DEPTH = 4 if len(candidates) <= 22 else 3
-
-      # Root caps
-      ROOT_LM_POOL = min(len(candidates), 24)  
-      K_ROOT = min(12, ROOT_LM_POOL)           
-
-      # Beam below root
-      K_MAX = 7
-      K_MIN = 6
-
-      LAMBDA = 0.25
-
-      # ----------------------------
-      # 3) Root LM ordering 
-      # ----------------------------
-
-      pool_size = max(18, ROOT_LM_POOL) 
-      pool_size = min(pool_size, len(candidates))
-
-      root_pool = self._top_k_heuristic(board, candidates, k=pool_size)
-
-      root_uci = [m.uci() for m in root_pool]
-      root_scores = self._score_legal_moves(fen, root_uci)
-
-      top_root = self._top_k_by_score(root_uci, root_scores, k=K_ROOT)
-      uci_to_move = {m.uci(): m for m in root_pool}
-
-      # cand_pairs is now only top K_ROOT, ordered by LM score
-      cand_pairs = [(uci_to_move[uci], sc) for (uci, sc) in top_root if uci in uci_to_move]
-
-      # Decide whether we are maximizing or minimizing White-eval
-      root_is_white = (board.turn == chess.WHITE)
-
-      # Initialize best value from White perspective
-      best_val = -10**9 if root_is_white else 10**9
-      best_move = cand_pairs[0][0]  # fallback to best LM move
-
-      for m, my_lm_score in cand_pairs[: min(K_ROOT, len(cand_pairs))]:
-        # Root move bonus 
-        bonus = self._move_bonus(board, m, fen)
-
-        board.push(m)
-
-        if board.is_checkmate():
-          board.pop()
-          return m.uci()
-
-        # Alpha-beta from the position after our move
-        val = self._alphabeta_beam(
-          board=board,
-          depth=DEPTH - 1,
-          alpha=-10**9,
-          beta=10**9,
-          k_max=K_MAX,
-          k_min=K_MIN,
-        )
-        board.pop()
-
-        # Root combines position eval + small move bonus
-        val = val + int(30 * LAMBDA * bonus)
-
-        if root_is_white:
-          if val > best_val:
-            best_val = val
-            best_move = m
-        else:
-          if val < best_val:
-            best_val = val
-            best_move = m
-
-      return best_move.uci()
-
-    except Exception:
-      return candidates[0].uci() if candidates else legal[0].uci()
-
-  # ============================================================================
-  # Tactical helpers
-  # ============================================================================
-
-  def _find_mate_in_1(self, board: chess.Board) -> Optional[str]:
-    """Return a UCI move that gives immediate checkmate, if any exists."""
-    for m in board.legal_moves:
-      board.push(m)
-      is_mate = board.is_checkmate()
-      board.pop()
-      if is_mate:
-        return m.uci()
-    return None
-
-  def _allows_opponent_mate_in_1(self, board: chess.Board, move: chess.Move) -> bool:
-    """Return True if, after playing 'move', the opponent has a mate-in-1 reply."""
-    board.push(move)
-    try:
-      for reply in board.legal_moves:
-        board.push(reply)
-        mate = board.is_checkmate()
-        board.pop()
-        if mate:
-          return True
-      return False
-    finally:
-      board.pop()
-
-  def _development_bonus(self, board: chess.Board, move: chess.Move, ply: int) -> float:
-    """
-    Small positional bonus to favor sensible development
-    """
-    # Only apply strongly in the opening
-    if ply > 20:
-      return 0.0
-
-    piece = board.piece_at(move.from_square)
-    if piece is None:
-      return 0.0
-
-    bonus = 0.0
-
-    # Identify side to move
-    us = board.turn
-
-    # Castle bonus 
-    if board.is_castling(move):
-      bonus += 3.5  
-      return bonus  
-
-    # Piece development bonuses 
-    if piece.piece_type == chess.KNIGHT:
-      # Knights
-      if (us == chess.WHITE and move.from_square in [chess.B1, chess.G1]) or \
-        (us == chess.BLACK and move.from_square in [chess.B8, chess.G8]):
-        bonus += 1.2
-      # prefer toward center: c3/f3 or c6/f6 
-      to = move.to_square
-      if us == chess.WHITE and to in [chess.C3, chess.F3, chess.D2, chess.E2]:
-        bonus += 0.5
-      if us == chess.BLACK and to in [chess.C6, chess.F6, chess.D7, chess.E7]:
-        bonus += 0.5
-
-    # Bishops to active diagonals
-    if piece.piece_type == chess.BISHOP:
-      if (us == chess.WHITE and move.from_square in [chess.C1, chess.F1]) or \
-        (us == chess.BLACK and move.from_square in [chess.C8, chess.F8]):
-        bonus += 1.0
-      # small bias for common developing squares
-      if us == chess.WHITE and move.to_square in [chess.C4, chess.B5, chess.D3, chess.E2, chess.F4]:
-        bonus += 0.4
-      if us == chess.BLACK and move.to_square in [chess.C5, chess.B4, chess.D6, chess.E7, chess.F5]:
-        bonus += 0.4
-
-    # Penalize early queen moves 
-    if piece.piece_type == chess.QUEEN and ply <= 12:
-      bonus -= 1.2
-
-    # Penalize rook moves very early 
-    if piece.piece_type == chess.ROOK and ply <= 14:
-      bonus -= 0.6
-
-    # Pawn move shaping 
-    if piece.piece_type == chess.PAWN:
-      # Prefer central pawn moves in the opening
-      if us == chess.WHITE and move.from_square in [chess.D2, chess.E2, chess.C2]:
-        bonus += 0.4
-      if us == chess.BLACK and move.from_square in [chess.D7, chess.E7, chess.C7]:
-        bonus += 0.4
-
-      # Penalize flank pawns early and random shuffles
-      if us == chess.WHITE and move.from_square in [chess.A2, chess.H2] and ply <= 10:
-        bonus -= 0.6
-      if us == chess.BLACK and move.from_square in [chess.A7, chess.H7] and ply <= 10:
-        bonus -= 0.6
-
-    # Discourage moving same piece repeatedly early 
-    if move.to_square == move.from_square:
-      bonus -= 0.5
-
-    #  Small bonus for giving check 
-    if board.gives_check(move):
-      bonus += 0.2
-
-    return bonus
-
-  def _piece_value(self, piece_type: int) -> int:
-    return {
-      chess.PAWN: 1,
-      chess.KNIGHT: 3,
-      chess.BISHOP: 3,
-      chess.ROOK: 5,
-      chess.QUEEN: 9,
-      chess.KING: 0,
-    }.get(piece_type, 0)
-
-
-  def _capture_bonus(self, board: chess.Board, move: chess.Move, ply: int) -> float:
-    """
-    Small bonus to encourage making progress via captures.
-    """
-    if not board.is_capture(move):
-      return 0.0
-
-    # De-emphasize capture greed in very late game
-    if ply > 80:
-      scale = 0.4
-    else:
-      scale = 1.0
-
-    victim = board.piece_at(move.to_square)
-    attacker = board.piece_at(move.from_square)
-
-    # En passant
-    if victim is None and board.is_en_passant(move):
-      victim_value = 1
-    else:
-      victim_value = self._piece_value(victim.piece_type) if victim else 1
-
-    attacker_value = self._piece_value(attacker.piece_type) if attacker else 1
-
-    # Prefer winning bigger pieces
-    bonus = 0.25 * victim_value - 0.05 * attacker_value
-
-    if board.gives_check(move):
-      bonus += 0.10
-
-    return scale * bonus
-
-  def _ply_from_fen(self, fen: str) -> int:
-    # FEN has halfmove_clock and fullmove_number; ply approx:
-    # ply = (fullmove-1)*2 + (0 if white to move else 1)
-    parts = fen.split()
-    fullmove = int(parts[5])
-    stm = parts[1]  # 'w' or 'b'
-    return (fullmove - 1) * 2 + (0 if stm == "w" else 1)
-
-  def _move_bonus(self, board: chess.Board, move: chess.Move, fen: str) -> float:
-    """
-    Combined heuristic bonus used to nudge move choice.
-    """
-    ply = self._ply_from_fen(fen)
-    dev = self._development_bonus(board, move, ply)
-    cap = self._capture_bonus(board, move, ply)
-    return dev + cap
-
-  # ============================================================================
-  # Static evaluation for alpha-beta
-  # ============================================================================
-
-  def _material_eval_white(self, board: chess.Board) -> int:
-    values = {
-      chess.PAWN: 100,
-      chess.KNIGHT: 320,
-      chess.BISHOP: 330,
-      chess.ROOK: 500,
-      chess.QUEEN: 900,
-      chess.KING: 0,
+        book: Dict[str, str] = {}
+
+        def add_line(moves: List[str]) -> None:
+            """Walk a sequence of UCI moves from the starting position and
+            store each FEN → next-move pair."""
+            board = chess.Board()
+            for uci in moves:
+                mv = chess.Move.from_uci(uci)
+                if mv not in board.legal_moves:
+                    break                       # Stop if any move is illegal
+                book.setdefault(board.fen(), uci)
+                board.push(mv)
+
+        # -------------------------------------------------------------------
+        # White repertoire – 1.e4
+        # -------------------------------------------------------------------
+        add_line(["e2e4"])
+
+        # vs 1…e5: Italian / Giuoco Piano
+        add_line(["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "d2d3"])
+        # vs 1…e5: Scotch-style centre break
+        add_line(["e2e4", "e7e5", "g1f3", "b8c6", "d2d4", "e5d4", "f3d4"])
+
+        # vs 1…c5 Sicilian – main Nc3 plans
+        add_line(["e2e4", "c7c5", "g1f3", "d7d6", "d2d4"])
+        add_line(["e2e4", "c7c5", "g1f3", "e7e6", "d2d4"])
+        add_line(["e2e4", "c7c5", "g1f3", "g8f6", "d2d4"])
+
+        # vs 1…e6 French
+        add_line(["e2e4", "e7e6", "d2d4", "d7d5", "b1c3"])
+
+        # vs 1…c6 Caro-Kann
+        add_line(["e2e4", "c7c6", "d2d4", "d7d5", "b1c3"])
+
+        # vs 1…d5 Scandinavian
+        add_line(["e2e4", "d7d5", "e4d5", "d8d5", "b1c3"])
+
+        # vs various early flank / unusual replies – just develop
+        for black_reply in ["a7a6", "h7h6", "g7g6", "b7b6", "f7f6",
+                            "g7g5", "d7d6", "b8c6", "g8f6"]:
+            add_line(["e2e4", black_reply, "g1f3"])
+
+        # vs 1…g6 – claim the centre
+        add_line(["e2e4", "g7g6", "d2d4", "f8g7", "f1c4"])
+
+        # -------------------------------------------------------------------
+        # Black repertoire vs 1.e4 – Caro-Kann (1…c6)
+        # -------------------------------------------------------------------
+        add_line(["e2e4", "c7c6"])
+
+        # Main line: 2.d4 d5 3.Nc3 dxe4 (Classical)
+        add_line(["e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"])
+        add_line(["e2e4", "c7c6", "g1f3", "d7d5"])
+        add_line(["e2e4", "c7c6", "b1c3", "d7d5"])
+
+        # vs White's various second moves – always answer …d5
+        for white_second in ["f1c4", "f2f4", "h2h3", "a2a3", "g2g3", "b2b3"]:
+            add_line(["e2e4", "c7c6", white_second, "d7d5"])
+
+        # -------------------------------------------------------------------
+        # Black repertoire vs 1.d4 – Queen's Gambit Declined structure
+        # -------------------------------------------------------------------
+        add_line(["d2d4", "d7d5"])
+
+        # vs 2.c4 – QGD
+        add_line(["d2d4", "d7d5", "c2c4", "e7e6"])
+
+        # vs 2.Nf3 / 2.Nc3 – develop knight
+        add_line(["d2d4", "d7d5", "g1f3", "g8f6"])
+        add_line(["d2d4", "d7d5", "b1c3", "g8f6"])
+
+        # vs various quiet second moves – develop knight
+        for white_second in ["e2e3", "g2g3", "f2f4", "b2b3", "c2c3", "a2a3"]:
+            add_line(["d2d4", "d7d5", white_second, "g8f6"])
+
+        return book
+
+    # -----------------------------------------------------------------------
+    # Main entry point
+    # -----------------------------------------------------------------------
+
+    def get_move(self, fen: str) -> Optional[str]:
+        """
+        Choose a move for the position encoded by *fen*.
+
+        Decision pipeline
+        -----------------
+        0. Opening book – return immediately if position is covered.
+        1. Forced moves – return immediately if only one legal move.
+        2. Mate-in-1    – return immediately if a mating move exists.
+        3. Safety filter – discard moves that allow opponent mate-in-1.
+        4. LM policy    – rank the best candidates with DistilGPT-2.
+        5. Alpha-beta   – search each candidate and pick the best score.
+        """
+
+        # 0) Opening book
+        book_move = self.opening_book.get(fen)
+        if book_move is not None:
+            board_book = chess.Board(fen)
+            if chess.Move.from_uci(book_move) in board_book.legal_moves:
+                return book_move
+
+        board = chess.Board(fen)
+        legal = list(board.legal_moves)
+
+        if not legal:
+            return None
+        if len(legal) == 1:
+            return legal[0].uci()
+
+        # 1) Instant win: mate in 1
+        mate_move = self._find_mate_in_1(board)
+        if mate_move is not None:
+            return mate_move
+
+        try:
+            # 2) Safety filter: avoid moves that gift the opponent mate-in-1
+            safe_moves = [m for m in legal if not self._allows_opponent_mate_in_1(board, m)]
+            candidates = safe_moves if safe_moves else legal
+
+            # 3) Search depth depends on how many candidates remain
+            depth = DEPTH_FEW_CANDIDATES if len(candidates) <= CANDIDATE_THRESHOLD \
+                    else DEPTH_MANY_CANDIDATES
+
+            # 4) LM policy at the root
+            #    a) Pre-filter with cheap heuristics → root_pool
+            pool_size = min(max(18, ROOT_LM_POOL_SIZE), len(candidates))
+            root_pool = self._top_k_heuristic(board, candidates, k=pool_size)
+
+            #    b) Score the pool with the LM
+            root_uci    = [m.uci() for m in root_pool]
+            root_scores = self._score_legal_moves(fen, root_uci)
+
+            #    c) Keep the top-K_ROOT moves ranked by LM score
+            top_root     = self._top_k_by_score(root_uci, root_scores, k=K_ROOT)
+            uci_to_move  = {m.uci(): m for m in root_pool}
+            cand_pairs   = [(uci_to_move[uci], sc)
+                            for (uci, sc) in top_root if uci in uci_to_move]
+
+            # 5) Alpha-beta over the LM-ranked candidates
+            root_is_white = (board.turn == chess.WHITE)
+            best_val  = -10**9 if root_is_white else 10**9
+            best_move = cand_pairs[0][0]  # Fallback: best LM move
+
+            for m, _ in cand_pairs[:K_ROOT]:
+                bonus = self._move_bonus(board, m, fen)
+                board.push(m)
+
+                # Immediate checkmate – no need to search further
+                if board.is_checkmate():
+                    board.pop()
+                    return m.uci()
+
+                val = self._alphabeta_beam(
+                    board=board,
+                    depth=depth - 1,
+                    alpha=-10**9,
+                    beta=10**9,
+                    k_max=K_MAX,
+                    k_min=K_MIN,
+                )
+                board.pop()
+
+                # Blend alpha-beta score with small opening-heuristic bonus
+                val += int(30 * LM_BONUS_LAMBDA * bonus)
+
+                if root_is_white:
+                    if val > best_val:
+                        best_val, best_move = val, m
+                else:
+                    if val < best_val:
+                        best_val, best_move = val, m
+
+            return best_move.uci()
+
+        except Exception:
+            # If anything goes wrong, fall back to the first safe candidate
+            return candidates[0].uci() if candidates else legal[0].uci()
+
+    # -----------------------------------------------------------------------
+    # Tactical helpers
+    # -----------------------------------------------------------------------
+
+    def _find_mate_in_1(self, board: chess.Board) -> Optional[str]:
+        """Return a UCI move that delivers immediate checkmate, if one exists."""
+        for m in board.legal_moves:
+            board.push(m)
+            is_mate = board.is_checkmate()
+            board.pop()
+            if is_mate:
+                return m.uci()
+        return None
+
+    def _allows_opponent_mate_in_1(self, board: chess.Board, move: chess.Move) -> bool:
+        """Return True if playing *move* leaves the opponent a mating reply."""
+        board.push(move)
+        try:
+            for reply in board.legal_moves:
+                board.push(reply)
+                mate = board.is_checkmate()
+                board.pop()
+                if mate:
+                    return True
+            return False
+        finally:
+            board.pop()
+
+    # -----------------------------------------------------------------------
+    # Opening / positional heuristics
+    # -----------------------------------------------------------------------
+
+    def _development_bonus(self, board: chess.Board, move: chess.Move, ply: int) -> float:
+        """
+        Return a small floating-point bonus that nudges the engine toward
+        sound development principles in the opening (ply ≤ 20).
+
+        Bonuses reward:
+          - Castling
+          - Moving knights and bishops off the back rank toward active squares
+          - Central pawn advances
+
+        Penalties discourage:
+          - Early queen and rook moves
+          - Flank pawn shuffles in the first 10 moves
+        """
+        if ply > 20:
+            return 0.0
+
+        piece = board.piece_at(move.from_square)
+        if piece is None:
+            return 0.0
+
+        bonus = 0.0
+        us    = board.turn
+
+        # Castling is always good in the opening
+        if board.is_castling(move):
+            return 3.5
+
+        if piece.piece_type == chess.KNIGHT:
+            # Reward moving off the starting square …
+            starting = [chess.B1, chess.G1] if us == chess.WHITE else [chess.B8, chess.G8]
+            if move.from_square in starting:
+                bonus += 1.2
+            # … and landing on a central development square
+            central_white = [chess.C3, chess.F3, chess.D2, chess.E2]
+            central_black = [chess.C6, chess.F6, chess.D7, chess.E7]
+            if (us == chess.WHITE and move.to_square in central_white) or \
+               (us == chess.BLACK and move.to_square in central_black):
+                bonus += 0.5
+
+        elif piece.piece_type == chess.BISHOP:
+            # Reward moving off the back rank …
+            starting = [chess.C1, chess.F1] if us == chess.WHITE else [chess.C8, chess.F8]
+            if move.from_square in starting:
+                bonus += 1.0
+            # … and landing on an active diagonal
+            active_white = [chess.C4, chess.B5, chess.D3, chess.E2, chess.F4]
+            active_black = [chess.C5, chess.B4, chess.D6, chess.E7, chess.F5]
+            if (us == chess.WHITE and move.to_square in active_white) or \
+               (us == chess.BLACK and move.to_square in active_black):
+                bonus += 0.4
+
+        elif piece.piece_type == chess.QUEEN and ply <= 12:
+            bonus -= 1.2   # Premature queen activation is risky
+
+        elif piece.piece_type == chess.ROOK and ply <= 14:
+            bonus -= 0.6   # Rooks belong on open files, not the opening
+
+        elif piece.piece_type == chess.PAWN:
+            # Reward central pawn moves
+            central_pawns_white = [chess.D2, chess.E2, chess.C2]
+            central_pawns_black = [chess.D7, chess.E7, chess.C7]
+            if (us == chess.WHITE and move.from_square in central_pawns_white) or \
+               (us == chess.BLACK and move.from_square in central_pawns_black):
+                bonus += 0.4
+
+            # Penalise time-wasting flank pawn moves early on
+            flank_pawns_white = [chess.A2, chess.H2]
+            flank_pawns_black = [chess.A7, chess.H7]
+            if ply <= 10:
+                if (us == chess.WHITE and move.from_square in flank_pawns_white) or \
+                   (us == chess.BLACK and move.from_square in flank_pawns_black):
+                    bonus -= 0.6
+
+        # Small bonus for giving check (disrupts opponent's development)
+        if board.gives_check(move):
+            bonus += 0.2
+
+        return bonus
+
+    # Standard centipawn piece values used throughout
+    _PIECE_VALUES = {
+        chess.PAWN:   1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK:   5,
+        chess.QUEEN:  9,
+        chess.KING:   0,
     }
-    score = 0
-    for pt, v in values.items():
-      score += len(board.pieces(pt, chess.WHITE)) * v
-      score -= len(board.pieces(pt, chess.BLACK)) * v
-    return score
 
-  def _pst_eval_white(self, board: chess.Board) -> int:
-    """
-    Tiny piece-square tables (only knights & bishops) to reduce shuffling
-    and encourage centralization.
-    """
-    KNIGHT = [
-      -50,-40,-30,-30,-30,-30,-40,-50,
-      -40,-20,  0,  0,  0,  0,-20,-40,
-      -30,  0, 10, 15, 15, 10,  0,-30,
-      -30,  5, 15, 20, 20, 15,  5,-30,
-      -30,  0, 15, 20, 20, 15,  0,-30,
-      -30,  5, 10, 15, 15, 10,  5,-30,
-      -40,-20,  0,  5,  5,  0,-20,-40,
-      -50,-40,-30,-30,-30,-30,-40,-50,
-    ]
-    BISHOP = [
-      -20,-10,-10,-10,-10,-10,-10,-20,
-      -10,  0,  0,  0,  0,  0,  0,-10,
-      -10,  0,  5, 10, 10,  5,  0,-10,
-      -10,  5,  5, 10, 10,  5,  5,-10,
-      -10,  0, 10, 10, 10, 10,  0,-10,
-      -10, 10, 10, 10, 10, 10, 10,-10,
-      -10,  5,  0,  0,  0,  0,  5,-10,
-      -20,-10,-10,-10,-10,-10,-10,-20,
-    ]
+    def _piece_value(self, piece_type: int) -> int:
+        return self._PIECE_VALUES.get(piece_type, 0)
 
-    def idx(sq: int, color: bool) -> int:
-      return sq if color == chess.WHITE else chess.square_mirror(sq)
+    def _capture_bonus(self, board: chess.Board, move: chess.Move, ply: int) -> float:
+        """
+        Return a bonus that encourages capturing higher-value pieces.
 
-    score = 0
-    for sq in board.pieces(chess.KNIGHT, chess.WHITE):
-      score += KNIGHT[idx(sq, chess.WHITE)]
-    for sq in board.pieces(chess.KNIGHT, chess.BLACK):
-      score -= KNIGHT[idx(sq, chess.BLACK)]
+        Capture greed is down-scaled in the endgame (ply > 80) to avoid
+        unsound material grabbing when the position requires caution.
+        """
+        if not board.is_capture(move):
+            return 0.0
 
-    for sq in board.pieces(chess.BISHOP, chess.WHITE):
-      score += BISHOP[idx(sq, chess.WHITE)]
-    for sq in board.pieces(chess.BISHOP, chess.BLACK):
-      score -= BISHOP[idx(sq, chess.BLACK)]
+        scale = 0.4 if ply > 80 else 1.0
 
-    return score
+        victim   = board.piece_at(move.to_square)
+        attacker = board.piece_at(move.from_square)
 
-  def _mobility_eval_white(self, board: chess.Board) -> int:
-    """
-    Mobility: (#legal moves for White) - (#legal moves for Black)
-    """
-    try:
-      stm = board.turn
-      my_moves = board.legal_moves.count()
+        # En-passant: victim square is not the destination square
+        if victim is None and board.is_en_passant(move):
+            victim_value = 1
+        else:
+            victim_value = self._piece_value(victim.piece_type) if victim else 1
 
-      board.push(chess.Move.null())
-      opp_moves = board.legal_moves.count()
-      board.pop()
+        attacker_value = self._piece_value(attacker.piece_type) if attacker else 1
 
-      # If side-to-move was White, my_moves are White's mobility; else Black's
-      if stm == chess.WHITE:
-        return 2 * (my_moves - opp_moves)
-      else:
-        return -2 * (my_moves - opp_moves)
-    except Exception:
-      return 0
+        bonus = 0.25 * victim_value - 0.05 * attacker_value
 
-  def _static_eval_white(self, board: chess.Board) -> int:
-    """
-    Terminal-aware static evaluation from White perspective.
-    """
-    if board.is_checkmate():
-      # side to move is checkmated
-      return -999999 if board.turn == chess.WHITE else 999999
+        if board.gives_check(move):
+            bonus += 0.10   # Capture with check is especially forcing
 
-    if board.is_stalemate() or board.is_insufficient_material():
-      return 0
+        return scale * bonus
 
-    return (
-      self._material_eval_white(board)
-      + self._pst_eval_white(board)
-      + self._mobility_eval_white(board)
-    )
+    def _ply_from_fen(self, fen: str) -> int:
+        """Convert the FEN fullmove counter to a half-move (ply) count."""
+        parts     = fen.split()
+        fullmove  = int(parts[5])
+        side      = parts[1]   # 'w' or 'b'
+        return (fullmove - 1) * 2 + (0 if side == "w" else 1)
 
-  # ============================================================================
-  # LM-based move ordering for alpha-beta 
-  # ============================================================================
+    def _move_bonus(self, board: chess.Board, move: chess.Move, fen: str) -> float:
+        """Combined heuristic bonus: development + capture value."""
+        ply = self._ply_from_fen(fen)
+        return self._development_bonus(board, move, ply) + \
+               self._capture_bonus(board, move, ply)
 
-  def _ordered_moves_lm(
-  self,
-  board: chess.Board,
-  k: int,
-  prefilter_mult: int = 4,
-  prefilter_min: int = 18,
-  ) -> List[chess.Move]:
-    """
-    Return up to k legal moves ordered by LM score descending.
+    # -----------------------------------------------------------------------
+    # Static evaluation for alpha-beta leaf nodes
+    # -----------------------------------------------------------------------
 
-    Uses a cheap heuristic prefilter first to reduce LM scoring cost:
-      - score only top M moves by (check/capture/promo), where
-        M = max(prefilter_min, min(len(legal), k * prefilter_mult))
-    """
-    legal = list(board.legal_moves)
-    if not legal:
-      return []
+    def _material_eval_white(self, board: chess.Board) -> int:
+        """Material balance in centipawns from White's perspective."""
+        values = {
+            chess.PAWN:   100,
+            chess.KNIGHT: 320,
+            chess.BISHOP: 330,
+            chess.ROOK:   500,
+            chess.QUEEN:  900,
+            chess.KING:   0,
+        }
+        score = 0
+        for pt, v in values.items():
+            score += len(board.pieces(pt, chess.WHITE)) * v
+            score -= len(board.pieces(pt, chess.BLACK)) * v
+        return score
 
-    # Heuristic prefilter: only score subset with LM
-    M = max(prefilter_min, min(len(legal), k * prefilter_mult))
-    pool = self._top_k_heuristic(board, legal, k=M)
+    def _pst_eval_white(self, board: chess.Board) -> int:
+        """
+        Piece-square table bonus for knights and bishops (from White's perspective).
 
-    moves_uci = [m.uci() for m in pool]
-    scores = self._score_legal_moves(board.fen(), moves_uci)
+        Rewards centralisation and discourages pieces lingering on the rim.
+        Tables are indexed from White's perspective; Black pieces use the
+        mirrored square index.
+        """
+        # fmt: off
+        KNIGHT_PST = [
+            -50,-40,-30,-30,-30,-30,-40,-50,
+            -40,-20,  0,  0,  0,  0,-20,-40,
+            -30,  0, 10, 15, 15, 10,  0,-30,
+            -30,  5, 15, 20, 20, 15,  5,-30,
+            -30,  0, 15, 20, 20, 15,  0,-30,
+            -30,  5, 10, 15, 15, 10,  5,-30,
+            -40,-20,  0,  5,  5,  0,-20,-40,
+            -50,-40,-30,-30,-30,-30,-40,-50,
+        ]
+        BISHOP_PST = [
+            -20,-10,-10,-10,-10,-10,-10,-20,
+            -10,  0,  0,  0,  0,  0,  0,-10,
+            -10,  0,  5, 10, 10,  5,  0,-10,
+            -10,  5,  5, 10, 10,  5,  5,-10,
+            -10,  0, 10, 10, 10, 10,  0,-10,
+            -10, 10, 10, 10, 10, 10, 10,-10,
+            -10,  5,  0,  0,  0,  0,  5,-10,
+            -20,-10,-10,-10,-10,-10,-10,-20,
+        ]
+        # fmt: on
 
-    # Use helper to get top-k (uci, score) pairs
-    top = self._top_k_by_score(moves_uci, scores, k=k)
-    top_set = {uci for (uci, _) in top}
+        def pst_index(sq: int, color: bool) -> int:
+            """Return the PST index for *sq*, mirroring for Black."""
+            return sq if color == chess.WHITE else chess.square_mirror(sq)
 
-    # Preserve the LM rank order from top
-    uci_to_move = {m.uci(): m for m in pool}
-    return [uci_to_move[uci] for (uci, _) in top if uci in uci_to_move and uci in top_set]
+        score = 0
+        for sq in board.pieces(chess.KNIGHT, chess.WHITE):
+            score += KNIGHT_PST[pst_index(sq, chess.WHITE)]
+        for sq in board.pieces(chess.KNIGHT, chess.BLACK):
+            score -= KNIGHT_PST[pst_index(sq, chess.BLACK)]
 
-  # ============================================================================
-  # Beam alpha-beta
-  # ============================================================================
+        for sq in board.pieces(chess.BISHOP, chess.WHITE):
+            score += BISHOP_PST[pst_index(sq, chess.WHITE)]
+        for sq in board.pieces(chess.BISHOP, chess.BLACK):
+            score -= BISHOP_PST[pst_index(sq, chess.BLACK)]
 
-  def _alphabeta_beam(
-  self,
-  board: chess.Board,
-  depth: int,
-  alpha: int,
-  beta: int,
-  k_max: int,
-  k_min: int,
-  ) -> int:
-    if depth <= 0 or board.is_game_over(claim_draw=False):
-      return self._static_eval_white(board)
+        return score
 
-    white_to_move = (board.turn == chess.WHITE)
-    k = k_max if white_to_move else k_min
+    def _mobility_eval_white(self, board: chess.Board) -> int:
+        """
+        Mobility bonus: (White legal moves) − (Black legal moves), scaled by 2.
 
-    # Heuristic ordering only
-    moves = self._ordered_moves_heuristic(board, k=k)
-    if not moves:
-      return self._static_eval_white(board)
+        A null move is used to count the opponent's moves without altering the
+        game state.
+        """
+        try:
+            stm      = board.turn
+            my_moves = board.legal_moves.count()
 
-    if white_to_move:
-      value = -10**9
-      for m in moves:
-        board.push(m)
-        value = max(value, self._alphabeta_beam(board, depth - 1, alpha, beta, k_max, k_min))
-        board.pop()
-        alpha = max(alpha, value)
-        if alpha >= beta:
-          break
-      return value
-    else:
-      value = 10**9
-      for m in moves:
-        board.push(m)
-        value = min(value, self._alphabeta_beam(board, depth - 1, alpha, beta, k_max, k_min))
-        board.pop()
-        beta = min(beta, value)
-        if alpha >= beta:
-          break
-      return value
+            board.push(chess.Move.null())
+            opp_moves = board.legal_moves.count()
+            board.pop()
 
-  # ============================================================================
-  # Candidate selection helpers
-  # ============================================================================
+            # Adjust sign depending on which side is to move
+            if stm == chess.WHITE:
+                return 2 * (my_moves - opp_moves)
+            else:
+                return -2 * (my_moves - opp_moves)
+        except Exception:
+            return 0
 
-  def _top_k_heuristic(self, board: chess.Board, moves: List[chess.Move], k: int = 12) -> List[chess.Move]:
-    """
-    Heuristic filter to reduce scoring cost.
-    Prioritizes checks, captures, and promotions.
-    """
-    def score(m: chess.Move) -> int:
-      s = 0
-      if board.gives_check(m):
-        s += 1000
-      if board.is_capture(m):
-        s += 500
-      if m.promotion is not None:
-        s += 1000
-      return s
+    def _static_eval_white(self, board: chess.Board) -> int:
+        """
+        Terminal-aware leaf evaluation from White's perspective.
 
-    moves_sorted = sorted(moves, key=score, reverse=True)
-    return moves_sorted[: min(k, len(moves_sorted))]
+        Returns ±999 999 for checkmate and 0 for draws.
+        """
+        if board.is_checkmate():
+            return -999_999 if board.turn == chess.WHITE else 999_999
 
-  def _top_k_by_score(self, moves_uci: List[str], scores: List[float], k: int) -> List[Tuple[str, float]]:
-    """Return the top-k (move, score) pairs sorted by score descending."""
-    pairs = list(zip(moves_uci, scores))
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    return pairs[: min(k, len(pairs))]
+        if board.is_stalemate() or board.is_insufficient_material():
+            return 0
 
-  def _ordered_moves_heuristic(self, board: chess.Board, k: int) -> List[chess.Move]:
-    """
-    Cheap move ordering for search nodes 
-    Prioritize: checks, promotions, captures, then a tiny development bias.
-    """
-    ply = self._ply_from_fen(board.fen())
+        return (
+            self._material_eval_white(board)
+            + self._pst_eval_white(board)
+            + self._mobility_eval_white(board)
+        )
 
-    def score(m: chess.Move) -> float:
-      s = 0.0
+    # -----------------------------------------------------------------------
+    # LM-based move ordering helpers
+    # -----------------------------------------------------------------------
 
-      if m.promotion is not None:
-        s += 10000.0
+    def _ordered_moves_lm(
+        self,
+        board: chess.Board,
+        k: int,
+        prefilter_mult: int = 4,
+        prefilter_min:  int = 18,
+    ) -> List[chess.Move]:
+        """
+        Return up to *k* legal moves ranked by LM score (descending).
 
-      if board.gives_check(m):
-        s += 2000.0
+        A cheap heuristic pre-filter reduces the number of moves sent to the
+        LM: we score only the top M moves by tactical priority, where
+        M = max(prefilter_min, min(len(legal), k × prefilter_mult)).
+        """
+        legal = list(board.legal_moves)
+        if not legal:
+            return []
 
-      if board.is_capture(m):
-        victim = board.piece_at(m.to_square)
-        attacker = board.piece_at(m.from_square)
+        M    = max(prefilter_min, min(len(legal), k * prefilter_mult))
+        pool = self._top_k_heuristic(board, legal, k=M)
 
-        # en-passant victim not on to_square
-        victim_val = 1 if (victim is None and board.is_en_passant(m)) else (self._piece_value(victim.piece_type) if victim else 1)
-        attacker_val = self._piece_value(attacker.piece_type) if attacker else 1
+        moves_uci = [m.uci() for m in pool]
+        scores    = self._score_legal_moves(board.fen(), moves_uci)
 
-        # prefer winning larger pieces
-        s += 500.0 * victim_val - 50.0 * attacker_val
+        top     = self._top_k_by_score(moves_uci, scores, k=k)
+        top_set = {uci for (uci, _) in top}
 
-      # small opening bias
-      s += 30.0 * self._development_bonus(board, m, ply)
+        uci_to_move = {m.uci(): m for m in pool}
+        return [uci_to_move[uci] for (uci, _) in top
+                if uci in uci_to_move and uci in top_set]
 
-      return s
+    # -----------------------------------------------------------------------
+    # Alpha-beta beam search
+    # -----------------------------------------------------------------------
 
-    moves = list(board.legal_moves)
-    moves.sort(key=score, reverse=True)
-    return moves[: min(k, len(moves))]
+    def _alphabeta_beam(
+        self,
+        board: chess.Board,
+        depth: int,
+        alpha: int,
+        beta:  int,
+        k_max: int,
+        k_min: int,
+    ) -> int:
+        """
+        Beam-limited alpha-beta search returning a score from White's perspective.
 
-  # ============================================================================
-  # LM scoring + caching
-  # ============================================================================
+        The beam restricts branching: k_max branches for the maximising side
+        (White) and k_min for the minimising side (Black).  Move ordering uses
+        cheap heuristics (captures, checks, promotions) rather than the LM to
+        keep inner nodes fast.
+        """
+        if depth <= 0 or board.is_game_over(claim_draw=False):
+            return self._static_eval_white(board)
 
-  def _make_prompt(self, fen: str) -> str:
-    return f"FEN: {fen}\nMOVE:"
+        white_to_move = (board.turn == chess.WHITE)
+        k = k_max if white_to_move else k_min
 
-  @lru_cache(maxsize=4096)
-  def _cached_scores(self, fen: str, moves_tuple: Tuple[str, ...]) -> Tuple[float, ...]:
-    """
-    Memoize scores for a given (fen, sorted_moves_tuple).
-    """
-    return tuple(self._score_moves_batch(self._make_prompt(fen), list(moves_tuple)))
+        moves = self._ordered_moves_heuristic(board, k=k)
+        if not moves:
+            return self._static_eval_white(board)
 
-  def _score_legal_moves(self, fen: str, moves_uci: List[str]) -> List[float]:
-    """
-    Score each move in 'moves_uci' as average log-probability under the LM:
-      score(move) = avg_logP(move_tokens | prompt(FEN)).
-    """
-    moves_sorted = tuple(sorted(moves_uci))
-    scores_sorted = self._cached_scores(fen, moves_sorted)
+        if white_to_move:
+            value = -10**9
+            for m in moves:
+                board.push(m)
+                value = max(value, self._alphabeta_beam(board, depth - 1, alpha, beta, k_max, k_min))
+                board.pop()
+                alpha = max(alpha, value)
+                if alpha >= beta:
+                    break   # Beta cut-off
+            return value
+        else:
+            value = 10**9
+            for m in moves:
+                board.push(m)
+                value = min(value, self._alphabeta_beam(board, depth - 1, alpha, beta, k_max, k_min))
+                board.pop()
+                beta = min(beta, value)
+                if alpha >= beta:
+                    break   # Alpha cut-off
+            return value
 
-    # Map back to the original order
-    score_map = {m: s for m, s in zip(moves_sorted, scores_sorted)}
-    return [score_map[m] for m in moves_uci]
+    # -----------------------------------------------------------------------
+    # Candidate selection helpers
+    # -----------------------------------------------------------------------
 
-  # ----------------------------
-  # KV-cache encoding helpers
-  # ----------------------------
+    def _top_k_heuristic(
+        self,
+        board: chess.Board,
+        moves: List[chess.Move],
+        k: int = 12,
+    ) -> List[chess.Move]:
+        """
+        Return the top-k moves ranked by a fast tactical heuristic.
 
-  def _encode_prompt(self, prompt: str) -> torch.Tensor:
-    ids = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
-    return ids.to(self.dev)
+        Priority: promotions = checks > captures > all others.
+        Used as a cheap pre-filter before calling the (expensive) LM.
+        """
+        def score(m: chess.Move) -> int:
+            s = 0
+            if board.gives_check(m):
+                s += 1000
+            if board.is_capture(m):
+                s += 500
+            if m.promotion is not None:
+                s += 1000
+            return s
 
-  def _encode_move(self, mv: str) -> torch.Tensor:
-    """
-    Tokenizes a move string
-    """
-    ids = self.tokenizer(" " + mv, add_special_tokens=False, return_tensors="pt")["input_ids"]
-    return ids.to(self.dev)
+        return sorted(moves, key=score, reverse=True)[:k]
 
+    def _top_k_by_score(
+        self,
+        moves_uci: List[str],
+        scores:    List[float],
+        k: int,
+    ) -> List[Tuple[str, float]]:
+        """Return the top-k (UCI move, score) pairs sorted by score descending."""
+        pairs = sorted(zip(moves_uci, scores), key=lambda x: x[1], reverse=True)
+        return pairs[:k]
 
-  @torch.inference_mode()
-  def _score_moves_batch(self, prompt: str, moves: List[str]) -> List[float]:
-    if not moves:
-      return []
+    def _ordered_moves_heuristic(self, board: chess.Board, k: int) -> List[chess.Move]:
+        """
+        Order all legal moves by a fast heuristic for use *inside* the search tree.
 
-    # 1) Prompt forward pass once
-    prompt_ids = self._encode_prompt(prompt)  # (1, Lp)
-    out = self.model(input_ids=prompt_ids, use_cache=True)
+        Priority (highest first):
+          1. Promotions        (+10 000)
+          2. Checks            (+2 000)
+          3. Captures (MVV-LVA)
+          4. Development bonus (small opening-only weight)
+        """
+        ply = self._ply_from_fen(board.fen())
 
-    past = out.past_key_values                 
-    next_logits = out.logits[:, -1, :]         # (1, V)
+        def score(m: chess.Move) -> float:
+            s = 0.0
 
-    # 2) Encode all moves into padded batch
-    move_ids_list = [self._encode_move(mv).squeeze(0) for mv in moves]
-    lens = [int(t.numel()) for t in move_ids_list]
-    max_len = max(lens)
+            if m.promotion is not None:
+                s += 10_000.0
 
-    B = len(moves)
-    pad_id = self.tokenizer.pad_token_id
+            if board.gives_check(m):
+                s += 2_000.0
 
-    move_ids = torch.full((B, max_len), fill_value=pad_id, device=self.dev, dtype=torch.long)
-    move_attn = torch.zeros((B, max_len), device=self.dev, dtype=torch.bool)
+            if board.is_capture(m):
+                victim   = board.piece_at(m.to_square)
+                attacker = board.piece_at(m.from_square)
 
-    for i, t in enumerate(move_ids_list):
-      n = int(t.numel())
-      move_ids[i, :n] = t
-      move_attn[i, :n] = True
+                # En-passant: captured pawn is not on the destination square
+                victim_val   = 1 if (victim is None and board.is_en_passant(m)) \
+                               else (self._piece_value(victim.piece_type) if victim else 1)
+                attacker_val = self._piece_value(attacker.piece_type) if attacker else 1
 
-    # 3) Expand cache to batch size B 
-    if hasattr(past, "batch_repeat_interleave"):
-      # New Cache API (fast + correct)
-      past_b = past.batch_repeat_interleave(B)
-    elif isinstance(past, tuple):
-      # Legacy tuple cache (k,v per layer) -> manual expand
-      past_b = []
-      for layer in past:
-        k = layer[0]
-        v = layer[1]
-        past_b.append((
-          k.expand(B, -1, -1, -1).contiguous(),
-          v.expand(B, -1, -1, -1).contiguous(),
-        ))
-      past_b = tuple(past_b)
-    else:
-      # try a simple repeat if available
-      if hasattr(past, "repeat_interleave"):
-        past_b = past.repeat_interleave(B)
-      else:
-        raise TypeError(f"Unknown cache type: {type(past)}; cannot batch-expand")
+                s += 500.0 * victim_val - 50.0 * attacker_val   # MVV-LVA
 
-    # 4) Batched token logprob accumulation
-    token_logp_sum = torch.zeros((B,), device=self.dev)
-    token_count = torch.zeros((B,), device=self.dev)
+            s += 30.0 * self._development_bonus(board, m, ply)
 
-    # token 0 from prompt logits
-    logits0 = next_logits.expand(B, -1)
-    ids0 = move_ids[:, 0]
-    mask0 = move_attn[:, 0]
+            return s
 
-    lp0 = torch.log_softmax(logits0, dim=-1).gather(1, ids0.unsqueeze(1)).squeeze(1)
-    token_logp_sum += torch.where(mask0, lp0, torch.zeros_like(lp0))
-    token_count += mask0.to(token_count.dtype)
+        moves = list(board.legal_moves)
+        moves.sort(key=score, reverse=True)
+        return moves[:k]
 
-    # advance cache with token 0
-    cur_ids = ids0.unsqueeze(1)  # (B,1)
-    out = self.model(input_ids=cur_ids, past_key_values=past_b, use_cache=True)
-    past_b = out.past_key_values
-    cur_logits = out.logits[:, -1, :]
+    # -----------------------------------------------------------------------
+    # LM scoring and caching
+    # -----------------------------------------------------------------------
 
-    # tokens 1..max_len-1
-    for t in range(1, max_len):
-      ids_t = move_ids[:, t]
-      mask_t = move_attn[:, t]
+    def _make_prompt(self, fen: str) -> str:
+        """Format the FEN string into the prompt the LM sees."""
+        return f"FEN: {fen}\nMOVE:"
 
-      lp_t = torch.log_softmax(cur_logits, dim=-1).gather(1, ids_t.unsqueeze(1)).squeeze(1)
-      token_logp_sum += torch.where(mask_t, lp_t, torch.zeros_like(lp_t))
-      token_count += mask_t.to(token_count.dtype)
+    @lru_cache(maxsize=4096)
+    def _cached_scores(
+        self,
+        fen:         str,
+        moves_tuple: Tuple[str, ...],
+    ) -> Tuple[float, ...]:
+        """
+        Memoised wrapper around ``_score_moves_batch``.
 
-      cur_ids = ids_t.unsqueeze(1)
-      out = self.model(input_ids=cur_ids, past_key_values=past_b, use_cache=True)
-      past_b = out.past_key_values
-      cur_logits = out.logits[:, -1, :]
+        The moves are canonically sorted before caching so that different
+        orderings of the same set always hit the same cache entry.
+        """
+        return tuple(self._score_moves_batch(self._make_prompt(fen), list(moves_tuple)))
 
-    return (token_logp_sum / token_count.clamp_min(1.0)).detach().cpu().tolist()
+    def _score_legal_moves(self, fen: str, moves_uci: List[str]) -> List[float]:
+        """
+        Return a per-move LM score: average log P(move tokens | FEN prompt).
+
+        Internally sorts moves for cache efficiency then maps results back to
+        the original order.
+        """
+        moves_sorted  = tuple(sorted(moves_uci))
+        scores_sorted = self._cached_scores(fen, moves_sorted)
+
+        score_map = dict(zip(moves_sorted, scores_sorted))
+        return [score_map[m] for m in moves_uci]
+
+    # -----------------------------------------------------------------------
+    # KV-cache encoding helpers
+    # -----------------------------------------------------------------------
+
+    def _encode_prompt(self, prompt: str) -> torch.Tensor:
+        """Tokenise *prompt* and return a (1, L) token-ID tensor on device."""
+        ids = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
+        return ids.to(self.dev)
+
+    def _encode_move(self, mv: str) -> torch.Tensor:
+        """
+        Tokenise a single UCI move string.
+
+        A leading space is prepended so the tokeniser treats the move as a
+        continuation (e.g. " e2e4") rather than a fresh sequence start.
+        """
+        ids = self.tokenizer(" " + mv, add_special_tokens=False, return_tensors="pt")["input_ids"]
+        return ids.to(self.dev)
+
+    @torch.inference_mode()
+    def _score_moves_batch(self, prompt: str, moves: List[str]) -> List[float]:
+        """
+        Score all moves in a single batched forward pass through the LM.
+
+        Algorithm
+        ---------
+        1. Run the prompt through the model *once* to obtain the KV cache and
+           the logits for the first move token.
+        2. Encode all moves into a padded (B × max_len) tensor.
+        3. Expand the cached KV state to batch size B.
+        4. Walk token-by-token across the move sequences, accumulating the
+           log-probability of each real (non-padding) token.
+        5. Return the *average* log-probability per move.
+        """
+        if not moves:
+            return []
+
+        # ── Step 1: Encode the prompt and run it once ──────────────────────
+        prompt_ids  = self._encode_prompt(prompt)           # (1, L_prompt)
+        out         = self.model(input_ids=prompt_ids, use_cache=True)
+        past        = out.past_key_values
+        next_logits = out.logits[:, -1, :]                  # (1, V)
+
+        # ── Step 2: Pad all move sequences to the same length ──────────────
+        move_ids_list = [self._encode_move(mv).squeeze(0) for mv in moves]
+        lens    = [int(t.numel()) for t in move_ids_list]
+        max_len = max(lens)
+        B       = len(moves)
+        pad_id  = self.tokenizer.pad_token_id
+
+        move_ids  = torch.full((B, max_len), fill_value=pad_id,
+                               device=self.dev, dtype=torch.long)
+        move_attn = torch.zeros((B, max_len), device=self.dev, dtype=torch.bool)
+
+        for i, t in enumerate(move_ids_list):
+            n = int(t.numel())
+            move_ids[i, :n]  = t
+            move_attn[i, :n] = True
+
+        # ── Step 3: Expand the KV cache to batch size B ────────────────────
+        if hasattr(past, "batch_repeat_interleave"):
+            # Transformers ≥ 4.x fast Cache API
+            past_b = past.batch_repeat_interleave(B)
+        elif isinstance(past, tuple):
+            # Legacy tuple cache: (key, value) per layer
+            past_b = tuple(
+                (layer[0].expand(B, -1, -1, -1).contiguous(),
+                 layer[1].expand(B, -1, -1, -1).contiguous())
+                for layer in past
+            )
+        elif hasattr(past, "repeat_interleave"):
+            past_b = past.repeat_interleave(B)
+        else:
+            raise TypeError(f"Unknown KV-cache type: {type(past)}")
+
+        # ── Step 4: Accumulate per-token log-probabilities ─────────────────
+        token_logp_sum = torch.zeros((B,), device=self.dev)
+        token_count    = torch.zeros((B,), device=self.dev)
+
+        # Token 0: scored against the prompt's final logits
+        logits0 = next_logits.expand(B, -1)
+        ids0    = move_ids[:, 0]
+        mask0   = move_attn[:, 0]
+
+        lp0 = torch.log_softmax(logits0, dim=-1).gather(1, ids0.unsqueeze(1)).squeeze(1)
+        token_logp_sum += torch.where(mask0, lp0, torch.zeros_like(lp0))
+        token_count    += mask0.to(token_count.dtype)
+
+        # Advance the model with token 0 to get logits for token 1
+        cur_ids    = ids0.unsqueeze(1)                      # (B, 1)
+        out        = self.model(input_ids=cur_ids, past_key_values=past_b, use_cache=True)
+        past_b     = out.past_key_values
+        cur_logits = out.logits[:, -1, :]
+
+        # Tokens 1 … max_len−1
+        for t in range(1, max_len):
+            ids_t  = move_ids[:, t]
+            mask_t = move_attn[:, t]
+
+            lp_t = torch.log_softmax(cur_logits, dim=-1).gather(1, ids_t.unsqueeze(1)).squeeze(1)
+            token_logp_sum += torch.where(mask_t, lp_t, torch.zeros_like(lp_t))
+            token_count    += mask_t.to(token_count.dtype)
+
+            cur_ids    = ids_t.unsqueeze(1)
+            out        = self.model(input_ids=cur_ids, past_key_values=past_b, use_cache=True)
+            past_b     = out.past_key_values
+            cur_logits = out.logits[:, -1, :]
+
+        # ── Step 5: Return mean log-probability per move ───────────────────
+        return (token_logp_sum / token_count.clamp_min(1.0)).detach().cpu().tolist()
